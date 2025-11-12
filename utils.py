@@ -1,167 +1,136 @@
-from __future__ import annotations
+# This file is dual licensed under the terms of the Apache License, Version
+# 2.0, and the BSD License. See the LICENSE file in the root of this repository
+# for complete details.
 
-import typing as t
-from urllib.parse import quote
+import re
+from typing import FrozenSet, NewType, Tuple, Union, cast
 
-from .._internal import _plain_int
-from ..exceptions import SecurityError
-from ..urls import uri_to_iri
+from .tags import Tag, parse_tag
+from .version import InvalidVersion, Version
+
+BuildTag = Union[Tuple[()], Tuple[int, str]]
+NormalizedName = NewType("NormalizedName", str)
 
 
-def host_is_trusted(hostname: str | None, trusted_list: t.Iterable[str]) -> bool:
-    """Check if a host matches a list of trusted names.
-
-    :param hostname: The name to check.
-    :param trusted_list: A list of valid names to match. If a name
-        starts with a dot it will match all subdomains.
-
-    .. versionadded:: 0.9
+class InvalidWheelFilename(ValueError):
     """
-    if not hostname:
-        return False
+    An invalid wheel filename was found, users should refer to PEP 427.
+    """
 
-    try:
-        hostname = hostname.partition(":")[0].encode("idna").decode("ascii")
-    except UnicodeEncodeError:
-        return False
 
-    if isinstance(trusted_list, str):
-        trusted_list = [trusted_list]
+class InvalidSdistFilename(ValueError):
+    """
+    An invalid sdist filename was found, users should refer to the packaging user guide.
+    """
 
-    for ref in trusted_list:
-        if ref.startswith("."):
-            ref = ref[1:]
-            suffix_match = True
-        else:
-            suffix_match = False
 
+_canonicalize_regex = re.compile(r"[-_.]+")
+# PEP 427: The build number must start with a digit.
+_build_tag_regex = re.compile(r"(\d+)(.*)")
+
+
+def canonicalize_name(name: str) -> NormalizedName:
+    # This is taken from PEP 503.
+    value = _canonicalize_regex.sub("-", name).lower()
+    return cast(NormalizedName, value)
+
+
+def canonicalize_version(version: Union[Version, str]) -> str:
+    """
+    This is very similar to Version.__str__, but has one subtle difference
+    with the way it handles the release segment.
+    """
+    if isinstance(version, str):
         try:
-            ref = ref.partition(":")[0].encode("idna").decode("ascii")
-        except UnicodeEncodeError:
-            return False
+            parsed = Version(version)
+        except InvalidVersion:
+            # Legacy versions cannot be normalized
+            return version
+    else:
+        parsed = version
 
-        if ref == hostname or (suffix_match and hostname.endswith(f".{ref}")):
-            return True
+    parts = []
 
-    return False
+    # Epoch
+    if parsed.epoch != 0:
+        parts.append(f"{parsed.epoch}!")
 
+    # Release segment
+    # NB: This strips trailing '.0's to normalize
+    parts.append(re.sub(r"(\.0)+$", "", ".".join(str(x) for x in parsed.release)))
 
-def get_host(
-    scheme: str,
-    host_header: str | None,
-    server: tuple[str, int | None] | None = None,
-    trusted_hosts: t.Iterable[str] | None = None,
-) -> str:
-    """Return the host for the given parameters.
+    # Pre-release
+    if parsed.pre is not None:
+        parts.append("".join(str(x) for x in parsed.pre))
 
-    This first checks the ``host_header``. If it's not present, then
-    ``server`` is used. The host will only contain the port if it is
-    different than the standard port for the protocol.
+    # Post-release
+    if parsed.post is not None:
+        parts.append(f".post{parsed.post}")
 
-    Optionally, verify that the host is trusted using
-    :func:`host_is_trusted` and raise a
-    :exc:`~werkzeug.exceptions.SecurityError` if it is not.
+    # Development release
+    if parsed.dev is not None:
+        parts.append(f".dev{parsed.dev}")
 
-    :param scheme: The protocol the request used, like ``"https"``.
-    :param host_header: The ``Host`` header value.
-    :param server: Address of the server. ``(host, port)``, or
-        ``(path, None)`` for unix sockets.
-    :param trusted_hosts: A list of trusted host names.
+    # Local version segment
+    if parsed.local is not None:
+        parts.append(f"+{parsed.local}")
 
-    :return: Host, with port if necessary.
-    :raise ~werkzeug.exceptions.SecurityError: If the host is not
-        trusted.
-
-    .. versionchanged:: 3.1.3
-        If ``SERVER_NAME`` is IPv6, it is wrapped in ``[]``.
-    """
-    host = ""
-
-    if host_header is not None:
-        host = host_header
-    elif server is not None:
-        host = server[0]
-
-        # If SERVER_NAME is IPv6, wrap it in [] to match Host header.
-        # Check for : because domain or IPv4 can't have that.
-        if ":" in host and host[0] != "[":
-            host = f"[{host}]"
-
-        if server[1] is not None:
-            host = f"{host}:{server[1]}"
-
-    if scheme in {"http", "ws"} and host.endswith(":80"):
-        host = host[:-3]
-    elif scheme in {"https", "wss"} and host.endswith(":443"):
-        host = host[:-4]
-
-    if trusted_hosts is not None:
-        if not host_is_trusted(host, trusted_hosts):
-            raise SecurityError(f"Host {host!r} is not trusted.")
-
-    return host
+    return "".join(parts)
 
 
-def get_current_url(
-    scheme: str,
-    host: str,
-    root_path: str | None = None,
-    path: str | None = None,
-    query_string: bytes | None = None,
-) -> str:
-    """Recreate the URL for a request. If an optional part isn't
-    provided, it and subsequent parts are not included in the URL.
+def parse_wheel_filename(
+    filename: str,
+) -> Tuple[NormalizedName, Version, BuildTag, FrozenSet[Tag]]:
+    if not filename.endswith(".whl"):
+        raise InvalidWheelFilename(
+            f"Invalid wheel filename (extension must be '.whl'): {filename}"
+        )
 
-    The URL is an IRI, not a URI, so it may contain Unicode characters.
-    Use :func:`~werkzeug.urls.iri_to_uri` to convert it to ASCII.
+    filename = filename[:-4]
+    dashes = filename.count("-")
+    if dashes not in (4, 5):
+        raise InvalidWheelFilename(
+            f"Invalid wheel filename (wrong number of parts): {filename}"
+        )
 
-    :param scheme: The protocol the request used, like ``"https"``.
-    :param host: The host the request was made to. See :func:`get_host`.
-    :param root_path: Prefix that the application is mounted under. This
-        is prepended to ``path``.
-    :param path: The path part of the URL after ``root_path``.
-    :param query_string: The portion of the URL after the "?".
-    """
-    url = [scheme, "://", host]
-
-    if root_path is None:
-        url.append("/")
-        return uri_to_iri("".join(url))
-
-    # safe = https://url.spec.whatwg.org/#url-path-segment-string
-    # as well as percent for things that are already quoted
-    url.append(quote(root_path.rstrip("/"), safe="!$&'()*+,/:;=@%"))
-    url.append("/")
-
-    if path is None:
-        return uri_to_iri("".join(url))
-
-    url.append(quote(path.lstrip("/"), safe="!$&'()*+,/:;=@%"))
-
-    if query_string:
-        url.append("?")
-        url.append(quote(query_string, safe="!$&'()*+,/:;=?@%"))
-
-    return uri_to_iri("".join(url))
+    parts = filename.split("-", dashes - 2)
+    name_part = parts[0]
+    # See PEP 427 for the rules on escaping the project name
+    if "__" in name_part or re.match(r"^[\w\d._]*$", name_part, re.UNICODE) is None:
+        raise InvalidWheelFilename(f"Invalid project name: {filename}")
+    name = canonicalize_name(name_part)
+    version = Version(parts[1])
+    if dashes == 5:
+        build_part = parts[2]
+        build_match = _build_tag_regex.match(build_part)
+        if build_match is None:
+            raise InvalidWheelFilename(
+                f"Invalid build number: {build_part} in '{filename}'"
+            )
+        build = cast(BuildTag, (int(build_match.group(1)), build_match.group(2)))
+    else:
+        build = ()
+    tags = parse_tag(parts[-1])
+    return (name, version, build, tags)
 
 
-def get_content_length(
-    http_content_length: str | None = None,
-    http_transfer_encoding: str | None = None,
-) -> int | None:
-    """Return the ``Content-Length`` header value as an int. If the header is not given
-    or the ``Transfer-Encoding`` header is ``chunked``, ``None`` is returned to indicate
-    a streaming request. If the value is not an integer, or negative, 0 is returned.
+def parse_sdist_filename(filename: str) -> Tuple[NormalizedName, Version]:
+    if filename.endswith(".tar.gz"):
+        file_stem = filename[: -len(".tar.gz")]
+    elif filename.endswith(".zip"):
+        file_stem = filename[: -len(".zip")]
+    else:
+        raise InvalidSdistFilename(
+            f"Invalid sdist filename (extension must be '.tar.gz' or '.zip'):"
+            f" {filename}"
+        )
 
-    :param http_content_length: The Content-Length HTTP header.
-    :param http_transfer_encoding: The Transfer-Encoding HTTP header.
+    # We are requiring a PEP 440 version, which cannot contain dashes,
+    # so we split on the last dash.
+    name_part, sep, version_part = file_stem.rpartition("-")
+    if not sep:
+        raise InvalidSdistFilename(f"Invalid sdist filename: {filename}")
 
-    .. versionadded:: 2.2
-    """
-    if http_transfer_encoding == "chunked" or http_content_length is None:
-        return None
-
-    try:
-        return max(0, _plain_int(http_content_length))
-    except ValueError:
-        return 0
+    name = canonicalize_name(name_part)
+    version = Version(version_part)
+    return (name, version)
