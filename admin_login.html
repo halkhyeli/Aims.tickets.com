@@ -1,0 +1,14 @@
+
+{% extends "base.html" %}
+{% block title %}Admin Login{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>Admin Login</h2>
+  <form method="GET" action="{{ url_for('admin') }}">
+    <label>Admin Password</label>
+    <input type="password" name="key" required>
+    <button type="submit">Enter</button>
+  </form>
+  <p class="muted">Tip: set <code>ADMIN_PASS</code> environment variable on your server.</p>
+</div>
+{% endblock %}

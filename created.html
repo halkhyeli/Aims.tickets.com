@@ -1,0 +1,12 @@
+
+{% extends "base.html" %}
+{% block title %}Ticket Created{% endblock %}
+{% block content %}
+<div class="card success">
+  <h2>Ticket Submitted</h2>
+  <p><strong>Ticket #:</strong> {{ ticket_id }}</p>
+  <p><strong>Tracking PIN:</strong> <code>{{ pin }}</code></p>
+  <p>Keep this PIN to check your ticket status.</p>
+  <a class="btn" href="{{ url_for('status_pin', pin=pin) }}">View Status</a>
+</div>
+{% endblock %}

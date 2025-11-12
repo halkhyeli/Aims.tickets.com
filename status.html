@@ -1,0 +1,14 @@
+
+{% extends "base.html" %}
+{% block title %}Ticket Status{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>Ticket #{{ t.id }}</h2>
+  <p><strong>Status:</strong> <span class="badge {{ t.status }}">{{ t.status }}</span></p>
+  <p><strong>Subject:</strong> {{ t.subject }}</p>
+  <p><strong>Description:</strong> {{ t.description }}</p>
+  <hr/>
+  <p class="muted">Opened by {{ t.name or "—" }} ({{ t.email or "—" }}) • Dept: {{ t.department or "—" }}</p>
+  <p class="muted">Created: {{ t.created_at }} • Updated: {{ t.updated_at }}</p>
+</div>
+{% endblock %}

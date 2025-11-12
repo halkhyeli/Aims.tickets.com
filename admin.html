@@ -1,0 +1,37 @@
+
+{% extends "base.html" %}
+{% block title %}Admin{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>All Tickets</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>ID</th><th>Subject</th><th>Status</th><th>Owner</th><th>Created</th><th>Action</th></tr>
+      </thead>
+      <tbody>
+      {% for t in tickets %}
+        <tr>
+          <td>#{{ t.id }}</td>
+          <td>{{ t.subject }}</td>
+          <td><span class="badge {{ t.status }}">{{ t.status }}</span></td>
+          <td>{{ t.name or "—" }}<br><span class="muted small">{{ t.email or "" }}</span></td>
+          <td class="small">{{ t.created_at }}</td>
+          <td>
+            {% if t.status != 'closed' %}
+            <form method="POST" action="{{ url_for('admin_close', ticket_id=t.id) }}?key={{ request.args.get('key', '') or request.cookies.get('admin_key','') }}" onsubmit="return confirm('Close ticket #{{ t.id }}?');">
+              <button type="submit">Close</button>
+            </form>
+            {% else %}
+            <em>Closed</em>
+            {% endif %}
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="6">No tickets yet.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

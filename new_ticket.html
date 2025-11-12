@@ -1,0 +1,22 @@
+
+{% extends "base.html" %}
+{% block title %}Open a Ticket{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>Open a Ticket</h2>
+  {% if error %}<div class="alert error">{{ error }}</div>{% endif %}
+  <form method="POST" action="{{ url_for('submit') }}">
+    <label>Your Name</label>
+    <input name="name" required placeholder="e.g., Ahmed Al Falasi">
+    <label>Email</label>
+    <input type="email" name="email" required placeholder="name@company.com">
+    <label>Department</label>
+    <input name="department" placeholder="e.g., HR, Finance, Operations">
+    <label>Subject</label>
+    <input name="subject" required placeholder="Short title">
+    <label>Describe the issue</label>
+    <textarea name="description" rows="5" required placeholder="Give details, error messages, device, etc."></textarea>
+    <button type="submit">Submit Ticket</button>
+  </form>
+</div>
+{% endblock %}

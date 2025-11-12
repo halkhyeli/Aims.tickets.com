@@ -1,0 +1,26 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>{{ app_title }} - {% block title %}{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <h1>{{ app_title }}</h1>
+  <nav>
+    <a href="{{ url_for('index') }}">New Ticket</a>
+    <a href="{{ url_for('track') }}">Track Ticket</a>
+    <a href="{{ url_for('admin') }}">Admin</a>
+  </nav>
+</header>
+<main>
+  {% block content %}{% endblock %}
+</main>
+<footer>
+  <p>© {{ 2025 }} • Simple Ticket System</p>
+</footer>
+</body>
+</html>
