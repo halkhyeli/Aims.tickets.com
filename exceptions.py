@@ -1,152 +1,267 @@
-from __future__ import annotations
+# exceptions.py
 
-import difflib
-import typing as t
+import re
+import sys
+import typing
 
-from ..exceptions import BadRequest
-from ..exceptions import HTTPException
-from ..utils import cached_property
-from ..utils import redirect
-
-if t.TYPE_CHECKING:
-    from _typeshed.wsgi import WSGIEnvironment
-
-    from ..wrappers.request import Request
-    from ..wrappers.response import Response
-    from .map import MapAdapter
-    from .rules import Rule
+from .util import col, line, lineno, _collapse_string_to_ranges
+from .unicode import pyparsing_unicode as ppu
 
 
-class RoutingException(Exception):
-    """Special exceptions that require the application to redirect, notifying
-    about missing urls, etc.
-
-    :internal:
-    """
+class ExceptionWordUnicode(ppu.Latin1, ppu.LatinA, ppu.LatinB, ppu.Greek, ppu.Cyrillic):
+    pass
 
 
-class RequestRedirect(HTTPException, RoutingException):
-    """Raise if the map requests a redirect. This is for example the case if
-    `strict_slashes` are activated and an url that requires a trailing slash.
-
-    The attribute `new_url` contains the absolute destination url.
-    """
-
-    code = 308
-
-    def __init__(self, new_url: str) -> None:
-        super().__init__(new_url)
-        self.new_url = new_url
-
-    def get_response(
-        self,
-        environ: WSGIEnvironment | Request | None = None,
-        scope: dict[str, t.Any] | None = None,
-    ) -> Response:
-        return redirect(self.new_url, self.code)
+_extract_alphanums = _collapse_string_to_ranges(ExceptionWordUnicode.alphanums)
+_exception_word_extractor = re.compile("([" + _extract_alphanums + "]{1,16})|.")
 
 
-class RequestPath(RoutingException):
-    """Internal exception."""
+class ParseBaseException(Exception):
+    """base exception class for all parsing runtime exceptions"""
 
-    __slots__ = ("path_info",)
-
-    def __init__(self, path_info: str) -> None:
-        super().__init__()
-        self.path_info = path_info
-
-
-class RequestAliasRedirect(RoutingException):  # noqa: B903
-    """This rule is an alias and wants to redirect to the canonical URL."""
-
-    def __init__(self, matched_values: t.Mapping[str, t.Any], endpoint: t.Any) -> None:
-        super().__init__()
-        self.matched_values = matched_values
-        self.endpoint = endpoint
-
-
-class BuildError(RoutingException, LookupError):
-    """Raised if the build system cannot find a URL for an endpoint with the
-    values provided.
-    """
-
+    # Performance tuning: we construct a *lot* of these, so keep this
+    # constructor as small and fast as possible
     def __init__(
         self,
-        endpoint: t.Any,
-        values: t.Mapping[str, t.Any],
-        method: str | None,
-        adapter: MapAdapter | None = None,
-    ) -> None:
-        super().__init__(endpoint, values, method)
-        self.endpoint = endpoint
-        self.values = values
-        self.method = method
-        self.adapter = adapter
+        pstr: str,
+        loc: int = 0,
+        msg: typing.Optional[str] = None,
+        elem=None,
+    ):
+        self.loc = loc
+        if msg is None:
+            self.msg = pstr
+            self.pstr = ""
+        else:
+            self.msg = msg
+            self.pstr = pstr
+        self.parser_element = self.parserElement = elem
+        self.args = (pstr, loc, msg)
 
-    @cached_property
-    def suggested(self) -> Rule | None:
-        return self.closest_rule(self.adapter)
+    @staticmethod
+    def explain_exception(exc, depth=16):
+        """
+        Method to take an exception and translate the Python internal traceback into a list
+        of the pyparsing expressions that caused the exception to be raised.
 
-    def closest_rule(self, adapter: MapAdapter | None) -> Rule | None:
-        def _score_rule(rule: Rule) -> float:
-            return sum(
-                [
-                    0.98
-                    * difflib.SequenceMatcher(
-                        # endpoints can be any type, compare as strings
-                        None,
-                        str(rule.endpoint),
-                        str(self.endpoint),
-                    ).ratio(),
-                    0.01 * bool(set(self.values or ()).issubset(rule.arguments)),
-                    0.01 * bool(rule.methods and self.method in rule.methods),
-                ]
-            )
+        Parameters:
 
-        if adapter and adapter.map._rules:
-            return max(adapter.map._rules, key=_score_rule)
+        - exc - exception raised during parsing (need not be a ParseException, in support
+          of Python exceptions that might be raised in a parse action)
+        - depth (default=16) - number of levels back in the stack trace to list expression
+          and function names; if None, the full stack trace names will be listed; if 0, only
+          the failing input line, marker, and exception string will be shown
 
-        return None
+        Returns a multi-line string listing the ParserElements and/or function names in the
+        exception's stack trace.
+        """
+        import inspect
+        from .core import ParserElement
+
+        if depth is None:
+            depth = sys.getrecursionlimit()
+        ret = []
+        if isinstance(exc, ParseBaseException):
+            ret.append(exc.line)
+            ret.append(" " * (exc.column - 1) + "^")
+        ret.append("{}: {}".format(type(exc).__name__, exc))
+
+        if depth > 0:
+            callers = inspect.getinnerframes(exc.__traceback__, context=depth)
+            seen = set()
+            for i, ff in enumerate(callers[-depth:]):
+                frm = ff[0]
+
+                f_self = frm.f_locals.get("self", None)
+                if isinstance(f_self, ParserElement):
+                    if frm.f_code.co_name not in ("parseImpl", "_parseNoCache"):
+                        continue
+                    if id(f_self) in seen:
+                        continue
+                    seen.add(id(f_self))
+
+                    self_type = type(f_self)
+                    ret.append(
+                        "{}.{} - {}".format(
+                            self_type.__module__, self_type.__name__, f_self
+                        )
+                    )
+
+                elif f_self is not None:
+                    self_type = type(f_self)
+                    ret.append("{}.{}".format(self_type.__module__, self_type.__name__))
+
+                else:
+                    code = frm.f_code
+                    if code.co_name in ("wrapper", "<module>"):
+                        continue
+
+                    ret.append("{}".format(code.co_name))
+
+                depth -= 1
+                if not depth:
+                    break
+
+        return "\n".join(ret)
+
+    @classmethod
+    def _from_exception(cls, pe):
+        """
+        internal factory method to simplify creating one type of ParseException
+        from another - avoids having __init__ signature conflicts among subclasses
+        """
+        return cls(pe.pstr, pe.loc, pe.msg, pe.parserElement)
+
+    @property
+    def line(self) -> str:
+        """
+        Return the line of text where the exception occurred.
+        """
+        return line(self.loc, self.pstr)
+
+    @property
+    def lineno(self) -> int:
+        """
+        Return the 1-based line number of text where the exception occurred.
+        """
+        return lineno(self.loc, self.pstr)
+
+    @property
+    def col(self) -> int:
+        """
+        Return the 1-based column on the line of text where the exception occurred.
+        """
+        return col(self.loc, self.pstr)
+
+    @property
+    def column(self) -> int:
+        """
+        Return the 1-based column on the line of text where the exception occurred.
+        """
+        return col(self.loc, self.pstr)
 
     def __str__(self) -> str:
-        message = [f"Could not build url for endpoint {self.endpoint!r}"]
-        if self.method:
-            message.append(f" ({self.method!r})")
-        if self.values:
-            message.append(f" with values {sorted(self.values)!r}")
-        message.append(".")
-        if self.suggested:
-            if self.endpoint == self.suggested.endpoint:
-                if (
-                    self.method
-                    and self.suggested.methods is not None
-                    and self.method not in self.suggested.methods
-                ):
-                    message.append(
-                        " Did you mean to use methods"
-                        f" {sorted(self.suggested.methods)!r}?"
-                    )
-                missing_values = self.suggested.arguments.union(
-                    set(self.suggested.defaults or ())
-                ) - set(self.values.keys())
-                if missing_values:
-                    message.append(
-                        f" Did you forget to specify values {sorted(missing_values)!r}?"
-                    )
+        if self.pstr:
+            if self.loc >= len(self.pstr):
+                foundstr = ", found end of text"
             else:
-                message.append(f" Did you mean {self.suggested.endpoint!r} instead?")
-        return "".join(message)
+                # pull out next word at error location
+                found_match = _exception_word_extractor.match(self.pstr, self.loc)
+                if found_match is not None:
+                    found = found_match.group(0)
+                else:
+                    found = self.pstr[self.loc : self.loc + 1]
+                foundstr = (", found %r" % found).replace(r"\\", "\\")
+        else:
+            foundstr = ""
+        return "{}{}  (at char {}), (line:{}, col:{})".format(
+            self.msg, foundstr, self.loc, self.lineno, self.column
+        )
+
+    def __repr__(self):
+        return str(self)
+
+    def mark_input_line(self, marker_string: str = None, *, markerString=">!<") -> str:
+        """
+        Extracts the exception line from the input string, and marks
+        the location of the exception with a special symbol.
+        """
+        markerString = marker_string if marker_string is not None else markerString
+        line_str = self.line
+        line_column = self.column - 1
+        if markerString:
+            line_str = "".join(
+                (line_str[:line_column], markerString, line_str[line_column:])
+            )
+        return line_str.strip()
+
+    def explain(self, depth=16) -> str:
+        """
+        Method to translate the Python internal traceback into a list
+        of the pyparsing expressions that caused the exception to be raised.
+
+        Parameters:
+
+        - depth (default=16) - number of levels back in the stack trace to list expression
+          and function names; if None, the full stack trace names will be listed; if 0, only
+          the failing input line, marker, and exception string will be shown
+
+        Returns a multi-line string listing the ParserElements and/or function names in the
+        exception's stack trace.
+
+        Example::
+
+            expr = pp.Word(pp.nums) * 3
+            try:
+                expr.parse_string("123 456 A789")
+            except pp.ParseException as pe:
+                print(pe.explain(depth=0))
+
+        prints::
+
+            123 456 A789
+                    ^
+            ParseException: Expected W:(0-9), found 'A'  (at char 8), (line:1, col:9)
+
+        Note: the diagnostic output will include string representations of the expressions
+        that failed to parse. These representations will be more helpful if you use `set_name` to
+        give identifiable names to your expressions. Otherwise they will use the default string
+        forms, which may be cryptic to read.
+
+        Note: pyparsing's default truncation of exception tracebacks may also truncate the
+        stack of expressions that are displayed in the ``explain`` output. To get the full listing
+        of parser expressions, you may have to set ``ParserElement.verbose_stacktrace = True``
+        """
+        return self.explain_exception(self, depth)
+
+    markInputline = mark_input_line
 
 
-class WebsocketMismatch(BadRequest):
-    """The only matched rule is either a WebSocket and the request is
-    HTTP, or the rule is HTTP and the request is a WebSocket.
+class ParseException(ParseBaseException):
+    """
+    Exception thrown when a parse expression doesn't match the input string
+
+    Example::
+
+        try:
+            Word(nums).set_name("integer").parse_string("ABC")
+        except ParseException as pe:
+            print(pe)
+            print("column: {}".format(pe.column))
+
+    prints::
+
+       Expected integer (at char 0), (line:1, col:1)
+        column: 1
+
     """
 
 
-class NoMatch(Exception):
-    __slots__ = ("have_match_for", "websocket_mismatch")
+class ParseFatalException(ParseBaseException):
+    """
+    User-throwable exception thrown when inconsistent parse content
+    is found; stops all parsing immediately
+    """
 
-    def __init__(self, have_match_for: set[str], websocket_mismatch: bool) -> None:
-        self.have_match_for = have_match_for
-        self.websocket_mismatch = websocket_mismatch
+
+class ParseSyntaxException(ParseFatalException):
+    """
+    Just like :class:`ParseFatalException`, but thrown internally
+    when an :class:`ErrorStop<And._ErrorStop>` ('-' operator) indicates
+    that parsing is to stop immediately because an unbacktrackable
+    syntax error has been found.
+    """
+
+
+class RecursiveGrammarException(Exception):
+    """
+    Exception thrown by :class:`ParserElement.validate` if the
+    grammar could be left-recursive; parser may need to enable
+    left recursion using :class:`ParserElement.enable_left_recursion<ParserElement.enable_left_recursion>`
+    """
+
+    def __init__(self, parseElementList):
+        self.parseElementTrace = parseElementList
+
+    def __str__(self) -> str:
+        return "RecursiveGrammarException: {}".format(self.parseElementTrace)
